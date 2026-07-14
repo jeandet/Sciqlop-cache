@@ -9,16 +9,41 @@ and doing one cheap operation. On Windows this made the whole test take
 Bisection in the Speasy repo (2026-07-14) ruled out: process-spawn cost
 alone (~0.09s/step for a no-op spawn), generic heavy-native-import cost
 (numpy+pandas alone: ~0.7s/step), and the test's own dedup/cleanup logic
-(reproduces with zero speasy-specific code). It isolated the cost to
-opening a ``pysciqlop_cache`` connection from a freshly spawned process
-while 3 others do the same concurrently against the same file — even a
-bare ``Cache(path)`` + ``.get()`` with no write reproduced ~10-20s per
-open on Windows. Locally reproducing with ``spawn`` on Linux stayed fast
-(~0.06s/step for 4 processes), which rules out fork-vs-spawn as the
-mechanism and points at Windows-specific SQLite/WAL/mmap behavior
-(``PRAGMA mmap_size=268435456`` + ``busy_timeout=600000`` are the leading
-suspects — see CLAUDE.md "WAL mode + 600s busy_timeout for multi-process
-safety").
+(reproduces with zero speasy-specific code). It pointed at opening a
+``pysciqlop_cache`` connection from a freshly spawned process while 3
+others do the same concurrently against the same file — even a bare
+``from speasy.core.cache import _cache`` import (no explicit read/write)
+reproduced ~10-20s per open on Windows.
+
+**But** a bare ``pysciqlop_cache.Cache(path)`` + ``incr()`` reproducer
+(``test_fresh_process_per_step_stays_fast`` below) ran in **3.02s on real
+Windows CI** — not slow at all. That ruled out generic
+``pysciqlop_cache``-connection-open cost and pointed back at something
+speasy-specific: ``speasy.core.cache.cache.Cache.__init__`` (not the raw
+``pysciqlop_cache.Cache``) does, on *every* open::
+
+    if self.version < cache_version:   # "0.0.0" < "3.0" on a fresh cache
+        self._data.clear()
+        self.version = cache_version
+
+On a never-before-touched cache directory (the norm on an ephemeral CI
+runner), every process sees the stale default version and calls
+``clear()`` — which iterates and deletes every file in the cache
+directory (see ``_Store::clear()`` in ``store.hpp``). With 4 fresh
+processes racing to open the same brand-new cache simultaneously, several
+(not just the loser of a lock) can all attempt this delete-and-reinit at
+once — a thundering herd, not just a lock wait. Locally reproducing this
+exact version-check-then-``clear()`` race with ``spawn`` on Linux stayed
+fast (0.60s for 10x4,  see git history / speasy repo notes), so the
+`clear()` thundering herd itself isn't inherently slow — it's plausibly
+Windows-specific file-deletion contention (``std::filesystem::remove_all``
+racing across processes hits Windows sharing-violation retries far more
+than POSIX unlink does).
+
+``test_fresh_process_per_step_with_version_check_and_clear`` below
+reproduces speasy's exact ``Cache.__init__`` logic (version check +
+conditional ``clear()``) directly against ``pysciqlop_cache``, with no
+speasy dependency, to confirm this specific mechanism on real Windows CI.
 
 This test intentionally uses a fresh ``Process()`` per step (matching the
 real Speasy test), not a persistent ``Pool``, and calls ``incr`` (a real
@@ -42,6 +67,18 @@ def _open_and_incr(path, key):
     cache.incr(key, 1, default=0)
 
 
+def _open_like_speasy_and_incr(path, key):
+    """Mirrors speasy.core.cache.cache.Cache.__init__ exactly: version
+    check against a hardcoded target, clear() + version bump if stale."""
+    cache = Cache(cache_path=path)
+    cache.reset_stats()
+    version = cache.get("cache/version", "0.0.0")
+    if version < "3.0":
+        cache.clear()
+        cache["cache/version"] = "3.0"
+    cache.incr(key, 1, default=0)
+
+
 class TestWindowsMultiprocessStallRepro(unittest.TestCase):
 
     def setUp(self):
@@ -50,24 +87,19 @@ class TestWindowsMultiprocessStallRepro(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    def test_fresh_process_per_step_stays_fast(self):
-        """Regression guard: N steps of 4 fresh-process opens must stay
-        fast. Fails loudly (assertion) instead of silently stalling for
-        hours if the Windows connection-open contention regresses."""
-        n_steps = 10
-        max_seconds_per_step = 2.0
-
+    def _run_fresh_process_steps(self, target, n_steps, max_seconds_per_step):
         t0 = time.monotonic()
         for step in range(n_steps):
             key = f"counter::{step}"
             processes = [
-                Process(target=_open_and_incr, args=(self.tmp_dir, key))
+                Process(target=target, args=(self.tmp_dir, key))
                 for _ in range(4)
             ]
             for p in processes:
                 p.start()
             for p in processes:
                 p.join()
+            print(f"step {step}: {time.monotonic() - t0:.2f}s elapsed", flush=True)
 
         elapsed = time.monotonic() - t0
         per_step = elapsed / n_steps
@@ -78,6 +110,21 @@ class TestWindowsMultiprocessStallRepro(unittest.TestCase):
             f"{max_seconds_per_step}s/step. This is the exact pattern "
             f"behind the Speasy multiprocess Windows CI stall.",
         )
+
+    def test_fresh_process_per_step_stays_fast(self):
+        """Regression guard: N steps of 4 fresh-process opens (bare
+        pysciqlop_cache.Cache, no version-check/clear dance) must stay
+        fast. Confirmed fast on real Windows CI (3.02s/10 steps,
+        2026-07-14) - this is NOT the mechanism behind the Speasy stall."""
+        self._run_fresh_process_steps(_open_and_incr, n_steps=10, max_seconds_per_step=2.0)
+
+    def test_fresh_process_per_step_with_version_check_and_clear(self):
+        """Reproduces speasy's Cache.__init__ version-check-then-clear()
+        dance under 4-way fresh-process contention on a never-before-
+        touched cache dir - the leading suspect for the real stall
+        mechanism (see module docstring)."""
+        self._run_fresh_process_steps(
+            _open_like_speasy_and_incr, n_steps=10, max_seconds_per_step=2.0)
 
 
 if __name__ == "__main__":
